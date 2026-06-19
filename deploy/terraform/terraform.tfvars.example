@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars and set the IPs allowed to reach the public ALB.
+# This is what closes the Wiz EXTERNAL_ATTACK_SURFACE finding: the ALB is no
+# longer open to 0.0.0.0/0.
+#
+# Find your laptop's current public IP (the one the Vite dev proxy egresses from):
+#   curl -s https://checkip.amazonaws.com
+#
+# Note: if you are on a corporate VPN / Cloudflare WARP, this IP can rotate —
+# re-run the command and `terraform apply` again if you lose access. Add
+# teammates' IPs as extra /32 entries.
+allowed_cidrs = [
+  "203.0.113.10/32", # your laptop (update me)
+  # "203.0.113.7/32",  # teammate
+]

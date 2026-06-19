@@ -1,0 +1,122 @@
+#!/bin/bash
+set -xe
+exec > /var/log/acme-deploy.log 2>&1
+echo "=== acme-ofv bootstrap $(date -u) ==="
+
+REGION="${aws_region}"
+SECRET_NAME="${secret_name}"
+DEPLOY_BUCKET="${deploy_bucket}"
+DEPLOY_KEY="${deploy_key}"
+KAFKA_BROKERS="${kafka_brokers}"
+APP_DIR=/opt/acme-ofv
+
+# --- packages: docker, compose plugin, git, jq, openssl, tar ---
+dnf update -y
+dnf install -y docker git jq openssl tar awscli
+
+# Atlas + MSK hostnames must resolve via PUBLIC DNS: the VPC resolver returns
+# NXDOMAIN for *.mongodb.net, but public DNS returns the PrivateLink endpoint's
+# private IPs. Point the Docker daemon (hence every container) at public DNS.
+mkdir -p /etc/docker
+echo '{"dns":["8.8.8.8","1.1.1.1"]}' > /etc/docker/daemon.json
+
+systemctl enable --now docker
+
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+# --- code from S3 ---
+mkdir -p "$${APP_DIR}" "$${APP_DIR}/secrets"
+aws s3 cp "s3://$${DEPLOY_BUCKET}/$${DEPLOY_KEY}" /tmp/code.tar.gz --region "$${REGION}"
+tar -xzf /tmp/code.tar.gz -C "$${APP_DIR}"
+
+# --- secrets: Atlas URI (PrivateLink) + X.509 PEM (+ PKCS12 for Connect) + Voyage key ---
+SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$${SECRET_NAME}" \
+  --query SecretString --output text --region "$${REGION}")
+echo "$${SECRET_JSON}" | jq -r '.ATLAS_CERT_B64' | base64 -d > "$${APP_DIR}/secrets/atlas-x509.pem"
+ATLAS_URI=$(echo "$${SECRET_JSON}" | jq -r '.ATLAS_URI')
+VOYAGE_KEY=$(echo "$${SECRET_JSON}" | jq -r '.VOYAGE_API_KEY // ""')
+# Optional API key: when present in the secret, the DC API enforces X-API-Key.
+API_KEY=$(echo "$${SECRET_JSON}" | jq -r '.API_KEY // ""')
+
+# PKCS12 keystore for the Kafka Connect JVM (Java X.509 client auth)
+openssl pkcs12 -export \
+  -in "$${APP_DIR}/secrets/atlas-x509.pem" \
+  -out "$${APP_DIR}/secrets/atlas.p12" \
+  -name atlas -passout pass:changeit
+chmod 644 "$${APP_DIR}/secrets/atlas.p12" "$${APP_DIR}/secrets/atlas-x509.pem"
+
+# --- app runtime env (consumed by every app container via env_file) ---
+cat > "$${APP_DIR}/runtime.env" <<ENV
+ATLAS_URI=$${ATLAS_URI}
+ATLAS_CERT_PATH=/run/secrets/atlas-x509.pem
+DB_NAME=acme_ofv
+MOCK_DB_NAME=ofp_mock
+API_KEY=$${API_KEY}
+CONSENT_EVENT_TRANSPORT=kafka
+KAFKA_AUTH=msk_iam
+KAFKA_BOOTSTRAP=$${KAFKA_BROKERS}
+KAFKA_CONSENT_TOPIC=rcp.consent.events
+AWS_REGION=$${REGION}
+AWS_DEFAULT_REGION=$${REGION}
+VOYAGE_API_KEY=$${VOYAGE_KEY}
+OFP_BASE_URL=http://mock-ofp:8100
+DC_BASE_URL=http://api:8010
+ENV
+
+# --- build + start the stack ---
+cd "$${APP_DIR}/ops"
+docker compose -f docker-compose.aws.yml build
+docker compose -f docker-compose.aws.yml up -d
+
+# --- register the MongoDB sink once Connect REST is live ---
+cat > /tmp/connector.json <<'JSON'
+{
+  "connector.class": "com.mongodb.kafka.connect.MongoSinkConnector",
+  "topics": "rcp.consent.events",
+  "connection.uri": "mongodb+srv://your-cluster-pl-0.xxxxx.mongodb.net/?authSource=%24external&authMechanism=MONGODB-X509&tls=true&appName=acme-connect",
+  "database": "acme_ofv",
+  "collection": "consents",
+  "document.id.strategy": "com.mongodb.kafka.connect.sink.processor.id.strategy.ProvidedInValueStrategy",
+  "document.id.strategy.overwrite.existing": "true",
+  "writemodel.strategy": "com.mongodb.kafka.connect.sink.writemodel.strategy.ReplaceOneDefaultStrategy",
+  "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+  "value.converter": "org.apache.kafka.connect.storage.StringConverter",
+  "errors.tolerance": "none",
+  "max.batch.size": "500",
+  "tasks.max": "1"
+}
+JSON
+
+for i in $(seq 1 60); do
+  if curl -fsS http://localhost:8083/connectors >/dev/null 2>&1; then
+    curl -fsS -X PUT -H "Content-Type: application/json" \
+      --data @/tmp/connector.json \
+      http://localhost:8083/connectors/consents-mongo-sink/config && break
+  fi
+  sleep 5
+done
+
+# --- restart on boot ---
+cat > /etc/systemd/system/acme-ofv.service <<UNIT
+[Unit]
+Description=Acme-OFV stack
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=$${APP_DIR}/ops
+ExecStart=/usr/bin/docker compose -f docker-compose.aws.yml up -d
+ExecStop=/usr/bin/docker compose -f docker-compose.aws.yml down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable acme-ofv.service
+echo "=== bootstrap done $(date -u) ==="

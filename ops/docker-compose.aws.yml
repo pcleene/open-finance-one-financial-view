@@ -1,0 +1,76 @@
+# Full Acme-OFV backend stack on one EC2 (in the MSK VPC), behind the ALB.
+#   api (8010)  mock-ofp (8100)  eraser worker  kafka-connect (8083)
+# Consent events flow API/worker -> MSK topic -> Kafka Connect sink -> Atlas
+# acme_ofv.consents -> change stream -> worker. Atlas reached over PrivateLink
+# with X.509 (app: PEM via pymongo; Connect: PKCS12 via the JVM keystore).
+name: acme-ofv
+
+x-app-image: &app-image acme-ofv-app:latest
+
+services:
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    image: *app-image
+    command: ["gunicorn", "acme_ofv.api.app:app", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8010", "-w", "2", "--timeout", "120"]
+    ports: ["8010:8010"]
+    env_file: [/opt/acme-ofv/runtime.env]
+    volumes: ["/opt/acme-ofv/secrets:/run/secrets:ro"]
+    restart: always
+
+  mock-ofp:
+    image: *app-image
+    command: ["uvicorn", "acme_ofv.mock_ofp.app:app", "--host", "0.0.0.0", "--port", "8100"]
+    ports: ["8100:8100"]
+    env_file: [/opt/acme-ofv/runtime.env]
+    volumes: ["/opt/acme-ofv/secrets:/run/secrets:ro"]
+    restart: always
+    depends_on: [api]
+
+  worker:
+    image: *app-image
+    command: ["python", "-m", "acme_ofv.eraser.worker"]
+    env_file: [/opt/acme-ofv/runtime.env]
+    volumes: ["/opt/acme-ofv/secrets:/run/secrets:ro"]
+    restart: always
+    depends_on: [api]
+
+  kafka-connect:
+    build:
+      context: ./kafka
+      dockerfile: Dockerfile.connect
+    image: acme-ofv-connect:latest
+    ports: ["8083:8083"]
+    volumes: ["/opt/acme-ofv/secrets:/secrets:ro"]
+    restart: always
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: "b-1.your-msk.kafka.ap-southeast-1.amazonaws.com:9098,b-2.your-msk.kafka.ap-southeast-1.amazonaws.com:9098"
+      CONNECT_REST_PORT: "8083"
+      CONNECT_REST_ADVERTISED_HOST_NAME: "kafka-connect"
+      CONNECT_GROUP_ID: "acme-connect"
+      CONNECT_CONFIG_STORAGE_TOPIC: "acme.connect.configs"
+      CONNECT_OFFSET_STORAGE_TOPIC: "acme.connect.offsets"
+      CONNECT_STATUS_STORAGE_TOPIC: "acme.connect.status"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "2"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "2"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "2"
+      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.storage.StringConverter"
+      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.storage.StringConverter"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: "10000"
+      # --- MSK IAM auth (worker + producer + consumer + admin clients) ---
+      CONNECT_SECURITY_PROTOCOL: "SASL_SSL"
+      CONNECT_SASL_MECHANISM: "AWS_MSK_IAM"
+      CONNECT_SASL_JAAS_CONFIG: "software.amazon.msk.auth.iam.IAMLoginModule required;"
+      CONNECT_SASL_CLIENT_CALLBACK_HANDLER_CLASS: "software.amazon.msk.auth.iam.IAMClientCallbackHandler"
+      CONNECT_PRODUCER_SECURITY_PROTOCOL: "SASL_SSL"
+      CONNECT_PRODUCER_SASL_MECHANISM: "AWS_MSK_IAM"
+      CONNECT_PRODUCER_SASL_JAAS_CONFIG: "software.amazon.msk.auth.iam.IAMLoginModule required;"
+      CONNECT_PRODUCER_SASL_CLIENT_CALLBACK_HANDLER_CLASS: "software.amazon.msk.auth.iam.IAMClientCallbackHandler"
+      CONNECT_CONSUMER_SECURITY_PROTOCOL: "SASL_SSL"
+      CONNECT_CONSUMER_SASL_MECHANISM: "AWS_MSK_IAM"
+      CONNECT_CONSUMER_SASL_JAAS_CONFIG: "software.amazon.msk.auth.iam.IAMLoginModule required;"
+      CONNECT_CONSUMER_SASL_CLIENT_CALLBACK_HANDLER_CLASS: "software.amazon.msk.auth.iam.IAMClientCallbackHandler"
+      # --- Atlas X.509 client cert for the MongoDB sink (JVM default SSLContext) ---
+      KAFKA_OPTS: "-Djavax.net.ssl.keyStore=/secrets/atlas.p12 -Djavax.net.ssl.keyStoreType=PKCS12 -Djavax.net.ssl.keyStorePassword=changeit"

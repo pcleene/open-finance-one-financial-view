@@ -1,0 +1,20 @@
+# Kafka Connect worker for the consent-event sink:
+#   - MongoDB Kafka Connect sink connector (writes consents)
+#   - aws-msk-iam-auth on the worker classpath (MSK IAM/SASL_SSL to the brokers)
+FROM confluentinc/cp-kafka-connect:7.6.1
+
+USER root
+
+# MongoDB sink connector into the plugin path
+RUN confluent-hub install --no-prompt mongodb/kafka-connect-mongodb:1.13.0
+
+# MSK IAM auth uber-jar. It must be on BOTH the Connect worker classpath
+# (/usr/share/java/kafka) AND the cp preflight "cub kafka-ready" classpath
+# (/usr/share/java/cp-base-new) — otherwise the container fails preflight with
+# "IAMClientCallbackHandler could not be found".
+ARG MSK_IAM_VERSION=2.2.0
+RUN curl -fsSL -o /usr/share/java/kafka/aws-msk-iam-auth.jar \
+      "https://github.com/aws/aws-msk-iam-auth/releases/download/v${MSK_IAM_VERSION}/aws-msk-iam-auth-${MSK_IAM_VERSION}-all.jar" \
+ && cp /usr/share/java/kafka/aws-msk-iam-auth.jar /usr/share/java/cp-base-new/aws-msk-iam-auth.jar
+
+USER appuser

@@ -1,0 +1,18 @@
+{
+  "name": "consents-mongo-sink",
+  "config": {
+    "connector.class": "com.mongodb.kafka.connect.MongoSinkConnector",
+    "topics": "rcp.consent.events",
+    "connection.uri": "mongodb+srv://your-cluster-pl-0.xxxxx.mongodb.net/?authSource=%24external&authMechanism=MONGODB-X509&tls=true&appName=acme-connect",
+    "database": "acme_ofv",
+    "collection": "consents",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "document.id.strategy": "com.mongodb.kafka.connect.sink.processor.id.strategy.ProvidedInValueStrategy",
+    "document.id.strategy.overwrite.existing": "true",
+    "writemodel.strategy": "com.mongodb.kafka.connect.sink.writemodel.strategy.ReplaceOneDefaultStrategy",
+    "errors.tolerance": "none",
+    "max.batch.size": "500",
+    "tasks.max": "1"
+  }
+}

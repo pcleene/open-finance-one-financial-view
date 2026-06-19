@@ -1,0 +1,40 @@
+# Internal working notes — ignored. The two public architecture docs below are
+# the exceptions (kept secret-free + generic so they can be pushed).
+docs/*
+!docs/ARCHITECTURE.md
+!docs/LUCIDCHART-DIAGRAM-BRIEF.md
+!docs/WALKTHROUGH.md
+
+# Secrets & local config (NEVER commit — this repo is published publicly)
+.env
+.env.*
+!.env.example
+secrets/
+
+# Python
+backend/.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Node / SvelteKit
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+frontend/.vite/
+
+# Local run artifacts
+ops/logs/
+
+# Terraform — state (may contain the generated TLS private key), local dirs,
+# tfvars (your allow-listed IPs), and the built deploy tarball.
+deploy/terraform/.terraform/
+deploy/terraform/.terraform.lock.hcl
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/*.tfvars
+!deploy/terraform/*.tfvars.example
+deploy/terraform/acme-ofv-deploy.tar.gz
+# Plan files embed resource values (incl. generated secrets) — never commit.
+deploy/terraform/tfplan
+deploy/terraform/*.tfplan
